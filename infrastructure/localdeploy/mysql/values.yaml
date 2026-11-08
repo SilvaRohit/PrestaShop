@@ -1,0 +1,16 @@
+image:
+  repository: mysql
+  tag: "8.4"
+  pullPolicy: IfNotPresent
+
+database:
+  name: prestashop
+  user: prestashop
+  existingSecret: mysql-credentials
+
+service:
+  port: 3306
+
+persistence:
+  storageClass: standard
+  size: 5Gi
