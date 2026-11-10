@@ -1,0 +1,8 @@
+image:
+  repository: maildev/maildev
+  tag: "2.2.1"
+  pullPolicy: IfNotPresent
+
+service:
+  smtpPort: 1025
+  webPort: 1080

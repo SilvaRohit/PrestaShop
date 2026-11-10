@@ -1,6 +1,6 @@
 # PrestaShop on Kubernetes: Local Helm Lab
 
-> **Status:** Local deployment, pod-restart tests, a scale-out to two ready application pods and a basic cross-pod browser check completed. Load balancing, concurrency, CI/CD, GitOps and AKS are not yet validated. This is a learning environment, not a production-ready store.
+> **Status:** Local deployment, pod-restart tests, a scale-out to two ready application pods, a basic cross-pod browser check, and MailDev email testing completed. Load balancing, concurrency, CI/CD, GitOps and AKS are not yet validated. This is a learning environment, not a production-ready store.
 
 ## Project overview
 
@@ -19,6 +19,7 @@ The business scenario is an online store that must keep its product catalogue an
 - Disabled automatic application installation after initial setup and confirmed the store remained usable after a Helm upgrade.
 - Scaled the application to two ready pods on the Docker Desktop node; the Service listed both pod IPs as endpoints. Broader concurrency and transaction behaviour remains to be tested.
 - Manually forwarded to each pod in turn using the same local browser address; the user reported that the admin session, sample product and image worked after the switch.
+- Deployed MailDev locally, configured PrestaShop to send test email through its SMTP Service, received a test email and successfully created a test customer.
 
 The table count is an observation from this installation, not a universal correctness check. Pod restart testing demonstrates persistence in this local cluster; it does not demonstrate a backup, a disaster recovery procedure, or high availability.
 
@@ -26,12 +27,15 @@ The table count is an observation from this installation, not a universal correc
 
 ```mermaid
 flowchart TB
-    Browser["Browser: localhost:8001"] --> Forward["kubectl port-forward"]
+    Browser["Local browser"] --> Forward["Store port-forward: 8001"]
+    Browser --> MailForward["Inbox port-forward: 1080"]
     subgraph Cluster["Docker Desktop Kubernetes"]
       subgraph Namespace["Namespace: prestashop-local"]
         WebService["PrestaShop Service"] --> Web["PrestaShop pods"]
         Web --> DBService["MySQL Service"]
         DBService --> DB["MySQL pod"]
+        Web -->|"SMTP: 1025"| MailService["MailDev Service"]
+        MailService --> Mail["MailDev pod"]
         Web --> WebPVC["prestashop-data PVC"]
         DB --> DBPVC["mysql-data PVC"]
         DBSecret["Database Secret"] -.-> Web
@@ -40,20 +44,22 @@ flowchart TB
       end
     end
     Forward --> WebService
+    MailForward --> MailService
 ```
 
-The lab runs on **one local node**. Its initial baseline used one application replica; during the verified scaling experiment the Helm release was changed to two replicas, while MySQL remained at one. A later change to three replicas was reported, followed by a request to return to one; the final applied replica count has not yet been verified in this documentation. `kubectl port-forward` selects a pod through the Service for local browser access; it is not an ingress controller or a load-balancing test.
+The lab runs on **one local node**. Its initial baseline used one application replica; during the verified scaling experiment the Helm release was changed to two replicas, while MySQL remained at one. A later change to three was reported, followed by a user-reported return to one. No separate final deployment output was recorded. `kubectl port-forward` selects a pod through the Service for local browser access; it is not an ingress controller or a load-balancing test.
 
 | Component | Lab configuration and observed history | Purpose |
 | --- | --- | --- |
 | Kubernetes | Docker Desktop, local single node | Runs workloads without creating Azure resources |
 | Application | `prestashop/prestashop:9.1.5-apache`, initially one replica, scaled to two for testing | Storefront and administration |
 | Database | `mysql:8.4`, one replica | Stores application data |
+| Email testing | MailDev SMTP `1025`, web interface `1080` | Captures test messages for local inspection |
 | Networking | Internal `ClusterIP` Services | Provides service discovery inside the namespace |
 | Database storage | `mysql-data`, 5 GiB, `standard` | Stores MySQL data across pod replacements |
 | Application storage | `prestashop-data`, 5 GiB, `standard` | Persists the local application's web directory |
 | Secrets | `mysql-credentials`, `prestashop-admin` | Supplies credentials separately from chart values |
-| Local access | `localhost:8001` via port-forward | Browser access to the store |
+| Local access | `localhost:8001` and `localhost:1080` via separate port-forwards | Browser access to the store and test inbox |
 
 MySQL 8.4.13 was observed in the tested environment, but the configured `mysql:8.4` tag can resolve to another patch release in future. Versioned tags can also be republished; review and pin image digests when stronger reproducibility is needed.
 
@@ -62,6 +68,11 @@ MySQL 8.4.13 was observed in the tested environment, but the configured `mysql:8
 ```text
 infrastructure/
 └── localdeploy/
+    ├── maildev/
+    │   ├── Chart.yaml
+    │   ├── values.yaml
+    │   └── templates/
+    │       └── ...
     ├── mysql/
     │   ├── Chart.yaml
     │   ├── values.yaml
@@ -79,7 +90,7 @@ infrastructure/
             └── ...
 ```
 
-The PrestaShop chart started from `helm create` and includes optional starter templates. Inspect enabled resources before deploying. The MySQL chart is specific to this local lab. Resource names such as `mysql` and the PVC names are fixed in the current templates; installing a second copy in the same namespace can cause naming conflicts.
+The PrestaShop chart started from `helm create` and includes optional starter templates. Inspect enabled resources before deploying. The MySQL and MailDev charts are specific to this local lab. The MailDev chart path and release were confirmed during troubleshooting; review the actual chart files and image tag before publishing. Resource names such as `mysql` and the PVC names are fixed in the current templates; installing a second copy in the same namespace can cause naming conflicts.
 
 ## Prerequisites
 
@@ -88,6 +99,7 @@ The PrestaShop chart started from `helm create` and includes optional starter te
 - The repository checked out on the branch containing both Helm charts.
 - Enough local disk and memory for the Kubernetes node, MySQL, PrestaShop and their images.
 - Port `8001` available on the host, or a coordinated change to the application domain and port-forward command.
+- Port `1080` available on the host when accessing the optional MailDev test inbox.
 
 Run from the repository root:
 
@@ -234,6 +246,41 @@ kubectl --context docker-desktop exec -n prestashop-local \
 
 Use the actual admin directory, not `admin-api`. Sign in with the configured admin email and the password chosen during Secret creation.
 
+### 7. Deploy MailDev for local email testing
+
+MailDev is a separate test SMTP server and browser inbox. The `maildev-local` Helm release runs in `prestashop-local`; the Service is named `maildev`. It is not a production email provider. Review the local MailDev chart and image tag, then on a fresh lab render and install it from the repository root:
+
+```bash
+helm lint ./infrastructure/localdeploy/maildev
+helm template maildev-local ./infrastructure/localdeploy/maildev \
+  --namespace prestashop-local
+```
+
+Verify that the render includes a Deployment and Service named `maildev`, with SMTP port `1025` and web port `1080`. Then install **only if the release does not already exist**:
+
+```bash
+helm install maildev-local ./infrastructure/localdeploy/maildev \
+  --namespace prestashop-local --kube-context docker-desktop
+
+kubectl --context docker-desktop rollout status deployment/maildev \
+  -n prestashop-local --timeout=5m
+kubectl --context docker-desktop get deployment/maildev service/maildev \
+  -n prestashop-local
+```
+
+For an existing release, render the intended chart and use `helm upgrade` rather than a second install. Run these commands from the repository root: using `.` while inside the PrestaShop chart selects the PrestaShop chart, not MailDev. In this lab an attempted upgrade with the wrong chart was blocked because the PrestaShop PVC belonged to another Helm release; do not bypass its ownership to fix a chart-path mistake. A Helm `deployed` status alone is insufficient: inspect `helm get manifest` if no expected Kubernetes resources appear.
+
+Forward the inbox Service from a separate local terminal:
+
+```bash
+kubectl --context docker-desktop port-forward -n prestashop-local \
+  service/maildev 1080:1080
+```
+
+Open <http://localhost:1080>. In PrestaShop's **Advanced Parameters → Email**, configure the local SMTP server as `maildev`, port `1025`, with no encryption and no credentials for the default test setup. Save the settings before sending a test. Use synthetic addresses and data. PrestaShop and MailDev resolve the Service name inside the same Kubernetes namespace; the browser accesses MailDev through the host port-forward.
+
+The default MailDev test setup captures messages instead of delivering them to real customer inboxes; do not enable relay for this exercise. Treat the test inbox as temporary unless persistent storage is deliberately configured and verified. Keep its UI private, and use a separately configured transactional email provider for a production store.
+
 ## Operational testing
 
 ### Test 1: resources and storage
@@ -285,11 +332,20 @@ kubectl --context docker-desktop rollout status deployment/mysql \
 
 **Observed:** the sample product and image survived both restarts. This verifies the tested restart scenario only; a backup-and-restore test remains outstanding.
 
+### Test 4: SMTP and customer creation
+
+1. Confirm `deployment/maildev` is ready and `service/maildev` exposes `1025/TCP` and `1080/TCP`.
+2. Start the MailDev port-forward and open the test inbox at `localhost:1080`.
+3. Configure and save the PrestaShop SMTP settings described above. Send a test email to a synthetic recipient and check the MailDev inbox.
+4. Create a test customer and verify the operation succeeds. Check related email separately when relevant; customer creation by itself is not proof that every notification was delivered.
+
+**Observed:** a test email was received in MailDev and a new test customer was created successfully. The first SMTP attempt timed out at `maildev:25`; the local Service uses SMTP port `1025`, so the SMTP settings must use that port. This is an internal test and does not demonstrate production email deliverability, SPF/DKIM/DMARC configuration, or an external mailbox.
+
 ## Scaling: local experiment
 
 **Observed:** a Helm upgrade from one to two application replicas rolled out successfully. Both pods reported `1/1 Running` on `desktop-control-plane`, and the PrestaShop Service listed two pod endpoints. When forwarding directly to each pod in turn using the same browser and `localhost:8001`, the user reported that the admin session, sample product and image worked after the switch. Both replicas use the same local node; this basic check does not establish how sessions are stored or validate concurrent traffic, load balancing, node failover or production readiness.
 
-The chart uses a `Recreate` rollout strategy. Increasing `replicaCount` changes the number of application pods, not the number of databases. Scaling MySQL by simply increasing its replicas is not a safe database replication design. The verified two-replica change was a Helm release override; at that point the chart values file was not edited. A later change to three was reported without a recorded deployment or verification output. The desired follow-up is to set one replica in the values file; confirm its applied result rather than assuming it succeeded.
+The chart uses a `Recreate` rollout strategy. Increasing `replicaCount` changes the number of application pods, not the number of databases. Scaling MySQL by simply increasing its replicas is not a safe database replication design. The verified two-replica change was a Helm release override; at that point the chart values file was not edited. A later change to three and a return to one were reported by the user, without a separate final deployment output in the recorded test.
 
 The current `prestashop-data` PVC is `ReadWriteOnce`. That means read/write attachment is restricted to one **node**, not necessarily one pod. Multiple pods on the same Docker Desktop node may mount it, but shared access does not prove the application is safe under concurrent use or across multiple nodes. The current full web-directory mount, application sessions, cache, uploads, installation, upgrades and file locking all need review. One local node also remains a single point of failure.
 
@@ -325,7 +381,7 @@ kubectl --context docker-desktop describe service prestashop-local \
 
 ### Managing the replica count in a file
 
-To return to one application replica, set `replicaCount: 1` in `infrastructure/localdeploy/prestashop/values.yaml`, then render and review the chart before upgrading. This file-based return to one replica is **not yet verified in the recorded results**. Check prior release overrides locally with `helm get values prestashop-local -n prestashop-local --kube-context docker-desktop`; do not share any secrets that might be present. Confirm the file contains all settings that should be retained, including `prestashop.installAuto: "0"`, the database Secret references and local domain. The `--reset-values` option deliberately discards previously stored release overrides, so migrate any required overrides into the file first.
+To return to one application replica, set `replicaCount: 1` in `infrastructure/localdeploy/prestashop/values.yaml`, then render and review the chart before upgrading. The user reported applying the return to one; no separate final deployment output was recorded. Check prior release overrides locally with `helm get values prestashop-local -n prestashop-local --kube-context docker-desktop`; do not share any secrets that might be present. Confirm the file contains all settings that should be retained, including `prestashop.installAuto: "0"`, the database Secret references and local domain. The `--reset-values` option deliberately discards previously stored release overrides, so migrate any required overrides into the file first.
 
 ```bash
 helm lint infrastructure/localdeploy/prestashop
@@ -357,6 +413,7 @@ Before calling a scaled design production-ready, assess shared or externalized f
 - Database files and application files both matter for a complete recovery. PVC persistence is not a backup; automated backups and isolated restore testing are future work.
 - MySQL runs in the cluster for learning. A future Azure design can evaluate Azure Database for MySQL Flexible Server with private connectivity, TLS, backups and measured sizing.
 - TLS, public ingress, observability, security hardening, payment sandbox integration and production performance testing have not been demonstrated here.
+- MailDev is for synthetic test email, not production delivery; its test inbox and any configuration should be protected and treated as ephemeral unless persistence is configured and verified.
 - Changing a Git value does not change the cluster until a Helm upgrade or a GitOps controller applies it. Helm itself is not an always-running reconciliation controller.
 - An application image update must be tested with the persisted web directory; a mount can retain old application files and affect upgrades.
 
