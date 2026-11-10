@@ -1,179 +1,435 @@
-About PrestaShop
---------
+# PrestaShop on Kubernetes: Local Helm Lab
 
-[![PHP checks and unit tests](https://github.com/PrestaShop/PrestaShop/actions/workflows/php.yml/badge.svg)](https://github.com/PrestaShop/PrestaShop/actions/workflows/php.yml)
-[![Integration tests](https://github.com/PrestaShop/PrestaShop/actions/workflows/integration.yml/badge.svg)](https://github.com/PrestaShop/PrestaShop/actions/workflows/integration.yml)
-[![UI tests](https://github.com/PrestaShop/PrestaShop/actions/workflows/sanity.yml/badge.svg)](https://github.com/PrestaShop/PrestaShop/actions/workflows/sanity.yml)
-[![Nightly Status](https://img.shields.io/endpoint?url=https%3A%2F%2Fapi-nightly.prestashop-project.org%2Fdata%2Fbadge&label=Nightly%20Status&cacheSeconds=3600)](https://nightly.prestashop-project.org/)
-[![Minimum PHP Version](https://img.shields.io/badge/php-%3E%3D%208.1-8892BF.svg?style=flat-square)](https://php.net/)
-[![GitHub release](https://img.shields.io/github/v/release/prestashop/prestashop?sort=semver)](https://github.com/PrestaShop/PrestaShop)
-[![LFX Health Score](https://insights.linuxfoundation.org/api/badge/health-score?project=prestashop)](https://insights.linuxfoundation.org/project/prestashop)
-[![Slack chat](https://img.shields.io/badge/Chat-on%20Slack-red)](https://www.prestashop-project.org/slack/)
-[![GitHub forks](https://img.shields.io/github/forks/PrestaShop/PrestaShop)](https://github.com/PrestaShop/PrestaShop/network)
-[![GitHub stars](https://img.shields.io/github/stars/PrestaShop/PrestaShop)](https://github.com/PrestaShop/PrestaShop/stargazers)
+> **Status:** Local deployment, pod-restart tests, a scale-out to two ready application pods, a basic cross-pod browser check, and MailDev email testing completed. Load balancing, concurrency, CI/CD, GitOps and AKS are not yet validated. This is a learning environment, not a production-ready store.
 
-PrestaShop is an Open Source e-commerce web application, committed to providing the best shopping cart experience for both merchants and customers. It is written in PHP, is highly customizable, supports all the major payment services, is translated in many languages and localized for many countries, has a fully responsive design (both front and back office), etc. [See all the available features][available-features].
+## Project overview
 
-<p align="center">
-  <img src="https://github.com/user-attachments/assets/e6342778-e528-4ae7-acf2-f0d097a1e932" alt="PrestaShop 9.0 back office"/>
-</p>
+This project deploys an open-source e-commerce application and a MySQL database on Docker Desktop Kubernetes. It focuses on the infrastructure and operational practices needed to run the application: Kubernetes workloads and Services, Helm releases, Secrets, persistent storage, testing and the path to Azure Kubernetes Service (AKS).
 
-This repository contains the source code of PrestaShop, which is intended for development and preview only. To download the latest stable public version of PrestaShop (currently, version 9.0), please go to [the releases page][download].
+The business scenario is an online store that must keep its product catalogue and images available when application or database containers restart. The lab uses sample data and a single local cluster to learn and document these behaviours before designing a production environment.
 
-The first stable version of PrestaShop 9.0 was released on June 10th, 2025. Learn more about it on [the Build devblog](https://build.prestashop-project.org/tag/9.0/).
+### What has been demonstrated
 
-About the `develop` branch
---------
+- Deployed PrestaShop and MySQL as separate Helm releases in the `prestashop-local` namespace.
+- Connected the application to MySQL through an internal Kubernetes Service.
+- Created separate persistent volume claims (PVCs) for the database and PrestaShop files.
+- Referenced Kubernetes Secrets rather than putting database and admin passwords in the charts.
+- Verified a new database was populated by the PrestaShop installer; the observed installation had 301 tables.
+- Confirmed a sample product and its uploaded image remained accessible after restarting the PrestaShop Deployment and then the MySQL Deployment.
+- Disabled automatic application installation after initial setup and confirmed the store remained usable after a Helm upgrade.
+- Scaled the application to two ready pods on the Docker Desktop node; the Service listed both pod IPs as endpoints. Broader concurrency and transaction behaviour remains to be tested.
+- Manually forwarded to each pod in turn using the same local browser address; the user reported that the admin session, sample product and image worked after the switch.
+- Deployed MailDev locally, configured PrestaShop to send test email through its SMTP Service, received a test email and successfully created a test customer.
 
-The `develop` branch of this repository contains the work in progress source code for the next version of PrestaShop. Currently, it is exclusively for version 9.1.
+The table count is an observation from this installation, not a universal correctness check. Pod restart testing demonstrates persistence in this local cluster; it does not demonstrate a backup, a disaster recovery procedure, or high availability.
 
-For more information on our branch system, read our guide on [installing PrestaShop for development][install-guide-dev].
+## Local architecture
 
-Server configuration
---------
+```mermaid
+flowchart TB
+    Browser["Local browser"] --> Forward["Store port-forward: 8001"]
+    Browser --> MailForward["Inbox port-forward: 1080"]
+    subgraph Cluster["Docker Desktop Kubernetes"]
+      subgraph Namespace["Namespace: prestashop-local"]
+        WebService["PrestaShop Service"] --> Web["PrestaShop pods"]
+        Web --> DBService["MySQL Service"]
+        DBService --> DB["MySQL pod"]
+        Web -->|"SMTP: 1025"| MailService["MailDev Service"]
+        MailService --> Mail["MailDev pod"]
+        Web --> WebPVC["prestashop-data PVC"]
+        DB --> DBPVC["mysql-data PVC"]
+        DBSecret["Database Secret"] -.-> Web
+        DBSecret -.-> DB
+        AdminSecret["Admin Secret"] -.-> Web
+      end
+    end
+    Forward --> WebService
+    MailForward --> MailService
+```
 
-To install the latest PrestaShop 9.0, you need a web server running PHP 8.1+ and any flavor of MySQL 5.6+ (MySQL, MariaDB, Percona Server, etc.).
+The lab runs on **one local node**. Its initial baseline used one application replica; during the verified scaling experiment the Helm release was changed to two replicas, while MySQL remained at one. A later change to three was reported, followed by a user-reported return to one. No separate final deployment output was recorded. `kubectl port-forward` selects a pod through the Service for local browser access; it is not an ingress controller or a load-balancing test.
 
-You will also need a database administration tool, such as phpMyAdmin, in order to create a database for PrestaShop.
-We recommend the Apache or Nginx web servers (check out our [example Nginx configuration file][example-nginx]).
+| Component | Lab configuration and observed history | Purpose |
+| --- | --- | --- |
+| Kubernetes | Docker Desktop, local single node | Runs workloads without creating Azure resources |
+| Application | `prestashop/prestashop:9.1.5-apache`, initially one replica, scaled to two for testing | Storefront and administration |
+| Database | `mysql:8.4`, one replica | Stores application data |
+| Email testing | MailDev SMTP `1025`, web interface `1080` | Captures test messages for local inspection |
+| Networking | Internal `ClusterIP` Services | Provides service discovery inside the namespace |
+| Database storage | `mysql-data`, 5 GiB, `standard` | Stores MySQL data across pod replacements |
+| Application storage | `prestashop-data`, 5 GiB, `standard` | Persists the local application's web directory |
+| Secrets | `mysql-credentials`, `prestashop-admin` | Supplies credentials separately from chart values |
+| Local access | `localhost:8001` and `localhost:1080` via separate port-forwards | Browser access to the store and test inbox |
 
-You can find more information on our [System requirements][system-requirements] page and on the [System Administrator Guide][sysadmin-guide].
+MySQL 8.4.13 was observed in the tested environment, but the configured `mysql:8.4` tag can resolve to another patch release in future. Versioned tags can also be republished; review and pin image digests when stronger reproducibility is needed.
 
-Installation
---------
+## Repository structure
 
-If you downloaded the source code from GitHub, read our guide on [installing PrestaShop for development][install-guide-dev]. If you intend to install a production shop, make sure to download the latest version from [our releases page][download], then read the [install guide for users][install-guide].
+```text
+infrastructure/
+└── localdeploy/
+    ├── maildev/
+    │   ├── Chart.yaml
+    │   ├── values.yaml
+    │   └── templates/
+    │       └── ...
+    ├── mysql/
+    │   ├── Chart.yaml
+    │   ├── values.yaml
+    │   └── templates/
+    │       ├── deployment.yml
+    │       ├── pvc.yml
+    │       └── service.yml
+    └── prestashop/
+        ├── Chart.yaml
+        ├── values.yaml
+        └── templates/
+            ├── deployment.yaml
+            ├── pvc.yaml
+            ├── service.yaml
+            └── ...
+```
 
-## 🐳 Docker Development Environment
+The PrestaShop chart started from `helm create` and includes optional starter templates. Inspect enabled resources before deploying. The MySQL and MailDev charts are specific to this local lab. The MailDev chart path and release were confirmed during troubleshooting; review the actual chart files and image tag before publishing. Resource names such as `mysql` and the PVC names are fixed in the current templates; installing a second copy in the same namespace can cause naming conflicts.
 
-PrestaShop provides a complete Docker-based development environment.
+## Prerequisites
 
-### Quick Start
+- Docker Desktop with Kubernetes enabled and a Ready node.
+- `kubectl`, Helm and Python 3 on the host.
+- The repository checked out on the branch containing both Helm charts.
+- Enough local disk and memory for the Kubernetes node, MySQL, PrestaShop and their images.
+- Port `8001` available on the host, or a coordinated change to the application domain and port-forward command.
+- Port `1080` available on the host when accessing the optional MailDev test inbox.
+
+Run from the repository root:
 
 ```bash
-# Start the development environment
-make docker-start
-
-# Access your PrestaShop installation
-# Frontend: http://localhost:8001
-# Backend: http://localhost:8001/admin-dev
-# Email testing: http://localhost:1080
+kubectl config get-contexts
+kubectl --context docker-desktop get nodes
+kubectl --context docker-desktop get storageclass
+helm version
 ```
 
-**Default Admin Credentials:**
-- Email: `demo@prestashop.com`
-- Password: `Pr3st4Sh0P`
+These instructions target the `docker-desktop` Kubernetes context. Confirm the context before applying any command. Do not use real customer or payment data in this lab.
 
-Or the backoffice on this URL: http://localhost:8001/admin-dev (default access credentials: demo@prestashop.com / Pr3st4Sh0P)
+## Fresh local deployment
 
-You can customize the admin credentials by setting the following environment variables before running docker compose:
+> These instructions describe a **new, empty lab**. They do not restore a previous store. Automatic initialization must not be pointed at an existing database as a reset procedure. Back up and verify any data that matters before changing releases, PVCs or the cluster.
+
+### 1. Validate the charts
+
+```bash
+helm lint infrastructure/localdeploy/mysql
+helm lint infrastructure/localdeploy/prestashop
+
+helm template mysql-local infrastructure/localdeploy/mysql \
+  --namespace prestashop-local
+
+helm template prestashop-local infrastructure/localdeploy/prestashop \
+  --namespace prestashop-local
 ```
-export ADMIN_MAIL=your-email@example.com
-export ADMIN_PASSWD=Your-Secure-Password
-docker compose up
+
+Review the rendered manifests: MySQL should reference `mysql-credentials`, and PrestaShop should reference that Secret and `prestashop-admin`. Rendering and linting do not create resources and do not prove that the application works.
+
+### 2. Create the namespace
+
+If it does not already exist:
+
+```bash
+kubectl --context docker-desktop create namespace prestashop-local
 ```
 
-Docker will bind your port **8001** to the web server. If you want to use other port, open and modify the file `docker-compose.yml`.
-MySQL credentials can also be found and modified in this file if needed.
+### 3. Create local Secrets
 
-**Note:**  Before auto-installing PrestaShop, this container checks the file *app/config/parameters.php* does not exist on startup.
-If you expect the container to (re)install your shop, remove this file if it exists. And make sure the container user `www-data`
-has write access to the whole workspace.
+The charts expect the following Secrets in `prestashop-local`:
 
-### Documentation
+| Secret | Keys | Used by |
+| --- | --- | --- |
+| `mysql-credentials` | `password`, `root-password` | MySQL initialization and the PrestaShop database connection |
+| `prestashop-admin` | `password` | Initial PrestaShop administrator creation |
 
-For detailed information, see:
+The following creates them on an **empty lab**. It generates separate MySQL passwords and prompts for an administrator password without echoing it. Save the administrator password securely; do not put it in Git. The script uses `create` and will fail instead of replacing an existing Secret. If one creation succeeds and the other fails, inspect the existing Secret names before retrying.
 
-- **[🚀 Development Guide](./docs/DEVELOPMENT.md)** - Complete setup and development guide
+```bash
+python3 - <<'PY'
+import getpass
+import json
+import secrets
+import subprocess
+import sys
 
-Documentation
---------
+password = getpass.getpass('Choose an admin password: ')
+confirmation = getpass.getpass('Confirm admin password: ')
+if password != confirmation or len(password) < 12:
+    sys.exit('Passwords must match and have at least 12 characters.')
 
-For technical information (core, module and theme development, performance...), head on to [PrestaShop DevDocs][devdocs]
+def create_secret(name, values):
+    secret = {
+        'apiVersion': 'v1', 'kind': 'Secret',
+        'metadata': {'name': name, 'namespace': 'prestashop-local'},
+        'type': 'Opaque', 'stringData': values,
+    }
+    subprocess.run(
+        ['kubectl', '--context', 'docker-desktop', 'create', '-f', '-'],
+        input=json.dumps(secret), text=True, check=True,
+    )
 
-If you want to learn how to use PrestaShop 9, read our [User documentation][user-doc].
+create_secret('mysql-credentials', {
+    'password': secrets.token_urlsafe(32),
+    'root-password': secrets.token_urlsafe(32),
+})
+create_secret('prestashop-admin', {'password': password})
+PY
+```
 
-First-time users will be particularly interested in the following guides:
+```bash
+kubectl --context docker-desktop get secrets -n prestashop-local
+```
 
-* [Getting Started][getting-started]: How to install PrestaShop, and what you need to know.
-* [User Guide][user-guide]: All there is to know to put PrestaShop to good use.
-* [Updating Guide][updating-guide]: Switching to the newest version is not trivial. Make sure you do it right.
-* [Merchant's Guide][merchant-guide]: Tips and tricks for first-time online sellers.
-* The [FAQ][faq-17] page should also be of tremendous help to you.
+The Secret references do not make a production secret-management system. Access to Kubernetes Secrets must be controlled, and base64 encoding does not encrypt them. Password changes in an existing Secret do not automatically update an initialized MySQL user or PrestaShop administrator.
 
+### 4. Install MySQL
 
-Contributing
---------
+```bash
+helm install mysql-local infrastructure/localdeploy/mysql \
+  --namespace prestashop-local --kube-context docker-desktop
 
-PrestaShop is an Open Source project, and it wouldn't be possible without the help of the [hundreds of contributors][contributors-md], who submitted improvements and bugfixes over the years. Thank you all!
+kubectl --context docker-desktop rollout status deployment/mysql \
+  -n prestashop-local --timeout=5m
 
-If you want to contribute code to PrestaShop, read the [CONTRIBUTING.md][contributing-md] file in this repository or read the [tutorials about contribution][contributing-tutorial] on the documentation site.
+kubectl --context docker-desktop get pods,svc,pvc -n prestashop-local
+```
 
-Don't know where to start? Check the [good first issue](https://github.com/PrestaShop/PrestaShop/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22) label to have a look at all beginner-friendly improvements and bug fixes.
+Expected: MySQL is ready, its Service exposes `3306/TCP`, and `mysql-data` is `Bound`. MySQL initializes its database and user when its data directory is empty. Reusing an existing PVC does not reinitialize credentials from updated environment variables.
 
-If you want to help translate PrestaShop in your language, [join us on Crowdin][crowdin]!
+### 5. Bootstrap PrestaShop once
 
-If using AI tools to write code, make sure your agent has read the [.ai/CONTEXT.md](.ai/CONTEXT.md) file. You can find more details in our dev doc regarding [AI assisted development](https://devdocs.prestashop-project.org/9/development/ai-assisted-development/).
+For a **new empty database and application volume**, use an explicit install override:
 
+```bash
+helm install prestashop-local infrastructure/localdeploy/prestashop \
+  --namespace prestashop-local --kube-context docker-desktop \
+  --set-string prestashop.installAuto=1
 
-Reporting Issues
---------
+kubectl --context docker-desktop rollout status deployment/prestashop-local \
+  -n prestashop-local --timeout=15m
+```
 
-Our bugtracker is on GitHub. We encourage you to [create detailed issues][create-issue] as soon as you see them.
+The selected hostname is `localhost:8001`; the lab admin email is configured in the chart. Review both values before installing. The initial installer may take several minutes. Investigate an interrupted or failed initialization before retrying; do not delete PVCs or a partially initialized database as an automatic recovery step.
 
-Read our [Contribute by reporting issues guide][reporting-issues] for details and tips.
+Once installation and login are confirmed, disable automatic installation for the existing store:
 
+```bash
+helm upgrade prestashop-local infrastructure/localdeploy/prestashop \
+  --namespace prestashop-local --kube-context docker-desktop \
+  --set-string prestashop.installAuto=0 \
+  --wait --timeout 10m
+```
 
-Reporting Security Issues
---------
+`installAuto=0` skips automatic installation. It does not delete data or independently disable all possible web installer access. The chart's normal value is `0`; enabling initialization is a deliberate first-install action.
 
-Responsible (and private) disclosure is a standard practice when someone encounters a security problem: before making it public, the discoverer informs the Core team about it, so that a fix can be prepared, and thus minimize the potential damage.
+### 6. Open the store
 
-The PrestaShop team tries to be very proactive when preventing security problems. Even so, critical issues might surface without notice.
+```bash
+kubectl --context docker-desktop port-forward \
+  -n prestashop-local service/prestashop-local 8001:80
+```
 
-This is why we have set up a [Bug Bounty Program][bug-bounty] where anyone can privately contact us with all the details about issues that affect the security of PrestaShop merchants or customers. Our security team will answer you, and discuss of a timeframe for your publication of the details.
+Keep the terminal open and visit <http://localhost:8001>. If the pod is replaced, the port-forward may end and need to be restarted. The admin directory may be generated during installation. To find it without printing credentials:
 
-Understanding a security issue means knowing how the attacker got in and hacked the site. If you have those details, then please do contact us privately about it (and please do not publish those details before we answer). If you do not know how the attacker got in, please [ask for help][support].
+```bash
+kubectl --context docker-desktop exec -n prestashop-local \
+  deployment/prestashop-local -- \
+  find /var/www/html -maxdepth 1 -type d -name 'admin*' \
+  -exec basename {} \;
+```
 
+Use the actual admin directory, not `admin-api`. Sign in with the configured admin email and the password chosen during Secret creation.
 
-Extending PrestaShop
---------
+### 7. Deploy MailDev for local email testing
 
-PrestaShop is a very extensible e-commerce platform, both through modules and themes. Developers can even override the default components and behaviors. Learn more about this on the [Modules documentation][modules-devdocs] and the [Themes documentation][themes-devdocs].
+MailDev is a separate test SMTP server and browser inbox. The `maildev-local` Helm release runs in `prestashop-local`; the Service is named `maildev`. It is not a production email provider. Review the local MailDev chart and image tag, then on a fresh lab render and install it from the repository root:
 
+```bash
+helm lint ./infrastructure/localdeploy/maildev
+helm template maildev-local ./infrastructure/localdeploy/maildev \
+  --namespace prestashop-local
+```
 
-Community forums
---------
+Verify that the render includes a Deployment and Service named `maildev`, with SMTP port `1025` and web port `1080`. Then install **only if the release does not already exist**:
 
-You can discuss about e-commerce, help other merchants and get help, and contribute to improving PrestaShop together with the PrestaShop community on [PrestaShop Slack channel][chat], [project's discussions on GitHub][ghdiscussions] or on the [the PrestaShop forums][forums].
+```bash
+helm install maildev-local ./infrastructure/localdeploy/maildev \
+  --namespace prestashop-local --kube-context docker-desktop
 
-Thank you for downloading and using the PrestaShop Open Source e-commerce solution!
+kubectl --context docker-desktop rollout status deployment/maildev \
+  -n prestashop-local --timeout=5m
+kubectl --context docker-desktop get deployment/maildev service/maildev \
+  -n prestashop-local
+```
 
-[available-features]: https://prestashop.com/create-online-store/
-[download]: https://www.prestashop-project.org/releases/prestashop90/
-[forums]: https://www.prestashop.com/forums/
-[ghdiscussions]: https://github.com/PrestaShop/PrestaShop/discussions
-[support]: https://www.prestashop-project.org/support/
-[chat]: https://www.prestashop-project.org/slack/
-[user-doc]: https://docs.prestashop-project.org
-[contributing-md]: CONTRIBUTING.md
-[contributing-tutorial]: https://devdocs.prestashop-project.org/9/contribute/
-[crowdin]: https://crowdin.net/project/prestashop-official
-[getting-started]: https://docs.prestashop-project.org/v.8-documentation/v/english/getting-started
-[user-guide]: https://docs.prestashop-project.org/v.8-documentation/v/english/user-guide
-[updating-guide]: https://docs.prestashop-project.org/1-6-documentation/english-documentation/updating-prestashop
-[merchant-guide]: https://docs.prestashop-project.org/1-6-documentation/english-documentation/merchants-guide
-[faq-17]: https://devdocs.prestashop-project.org/9/faq/
-[sysadmin-guide]: https://docs.prestashop-project.org/1-6-documentation/english-documentation/system-administrator-guide
-[contributors-md]: CONTRIBUTORS.md
-[example-nginx]: https://devdocs.prestashop-project.org/9/basics/installation/nginx/
-[docker-compose]: https://docs.docker.com/compose/
-[install-guide-dev]: https://devdocs.prestashop-project.org/9/basics/installation/
-[system-requirements]: https://devdocs.prestashop-project.org/9/basics/installation/system-requirements/
-[install-guide]: https://docs.prestashop-project.org/v.8-documentation/v/english/getting-started/installing-prestashop
-[devdocs]: https://devdocs.prestashop-project.org/
-[create-issue]: https://github.com/PrestaShop/PrestaShop/issues/new/choose
-[reporting-issues]: https://devdocs.prestashop-project.org/9/contribute/contribute-reporting-issues/
-[modules-devdocs]: https://devdocs.prestashop-project.org/9/modules/
-[themes-devdocs]: https://devdocs.prestashop-project.org/9/themes/
-[bug-bounty]: https://www.prestashop-project.org/security/bug-bounty/
+For an existing release, render the intended chart and use `helm upgrade` rather than a second install. Run these commands from the repository root: using `.` while inside the PrestaShop chart selects the PrestaShop chart, not MailDev. In this lab an attempted upgrade with the wrong chart was blocked because the PrestaShop PVC belonged to another Helm release; do not bypass its ownership to fix a chart-path mistake. A Helm `deployed` status alone is insufficient: inspect `helm get manifest` if no expected Kubernetes resources appear.
+
+Forward the inbox Service from a separate local terminal:
+
+```bash
+kubectl --context docker-desktop port-forward -n prestashop-local \
+  service/maildev 1080:1080
+```
+
+Open <http://localhost:1080>. In PrestaShop's **Advanced Parameters → Email**, configure the local SMTP server as `maildev`, port `1025`, with no encryption and no credentials for the default test setup. Save the settings before sending a test. Use synthetic addresses and data. PrestaShop and MailDev resolve the Service name inside the same Kubernetes namespace; the browser accesses MailDev through the host port-forward.
+
+The default MailDev test setup captures messages instead of delivering them to real customer inboxes; do not enable relay for this exercise. Treat the test inbox as temporary unless persistent storage is deliberately configured and verified. Keep its UI private, and use a separately configured transactional email provider for a production store.
+
+## Operational testing
+
+### Test 1: resources and storage
+
+```bash
+kubectl --context docker-desktop get pods,svc,pvc -n prestashop-local
+helm list --kube-context docker-desktop -n prestashop-local
+```
+
+Expected: both Deployments have ready pods; the MySQL and PrestaShop Services exist; both PVCs are `Bound`. Resource readiness alone does not establish successful checkout or end-to-end correctness.
+
+### Test 2: database initialization and authentication
+
+Run from the MySQL pod through the internal Service:
+
+```bash
+kubectl --context docker-desktop exec -n prestashop-local deployment/mysql -- \
+  sh -c 'MYSQL_PWD="$MYSQL_PASSWORD" exec mysql --protocol=TCP \
+    --host=mysql --user="$MYSQL_USER" "$MYSQL_DATABASE" \
+    -e "SELECT DATABASE() AS database_name, CURRENT_USER() AS authenticated_user, VERSION() AS mysql_version; SELECT COUNT(*) AS table_count FROM information_schema.tables WHERE table_schema = DATABASE();"'
+```
+
+Expected: the configured database and application user can connect. Before first setup the table count should be zero; after successful setup it should be greater than zero. Do not share credentials or paste full container environment output.
+
+### Test 3: product and file persistence
+
+1. Create a sample product with a price and a test image in the admin panel.
+2. Save it and confirm it can be reopened.
+3. Restart the PrestaShop Deployment and wait for it to become ready:
+
+```bash
+kubectl --context docker-desktop rollout restart deployment/prestashop-local \
+  -n prestashop-local
+kubectl --context docker-desktop rollout status deployment/prestashop-local \
+  -n prestashop-local --timeout=5m
+```
+
+4. Restart port-forwarding if necessary, then verify the product and image again.
+5. Repeat with the database Deployment, allowing for a temporary application interruption:
+
+```bash
+kubectl --context docker-desktop rollout restart deployment/mysql \
+  -n prestashop-local
+kubectl --context docker-desktop rollout status deployment/mysql \
+  -n prestashop-local --timeout=5m
+```
+
+6. Refresh the store and confirm the product details and image remain available.
+
+**Observed:** the sample product and image survived both restarts. This verifies the tested restart scenario only; a backup-and-restore test remains outstanding.
+
+### Test 4: SMTP and customer creation
+
+1. Confirm `deployment/maildev` is ready and `service/maildev` exposes `1025/TCP` and `1080/TCP`.
+2. Start the MailDev port-forward and open the test inbox at `localhost:1080`.
+3. Configure and save the PrestaShop SMTP settings described above. Send a test email to a synthetic recipient and check the MailDev inbox.
+4. Create a test customer and verify the operation succeeds. Check related email separately when relevant; customer creation by itself is not proof that every notification was delivered.
+
+**Observed:** a test email was received in MailDev and a new test customer was created successfully. The first SMTP attempt timed out at `maildev:25`; the local Service uses SMTP port `1025`, so the SMTP settings must use that port. This is an internal test and does not demonstrate production email deliverability, SPF/DKIM/DMARC configuration, or an external mailbox.
+
+## Scaling: local experiment
+
+**Observed:** a Helm upgrade from one to two application replicas rolled out successfully. Both pods reported `1/1 Running` on `desktop-control-plane`, and the PrestaShop Service listed two pod endpoints. When forwarding directly to each pod in turn using the same browser and `localhost:8001`, the user reported that the admin session, sample product and image worked after the switch. Both replicas use the same local node; this basic check does not establish how sessions are stored or validate concurrent traffic, load balancing, node failover or production readiness.
+
+The chart uses a `Recreate` rollout strategy. Increasing `replicaCount` changes the number of application pods, not the number of databases. Scaling MySQL by simply increasing its replicas is not a safe database replication design. The verified two-replica change was a Helm release override; at that point the chart values file was not edited. A later change to three and a return to one were reported by the user, without a separate final deployment output in the recorded test.
+
+The current `prestashop-data` PVC is `ReadWriteOnce`. That means read/write attachment is restricted to one **node**, not necessarily one pod. Multiple pods on the same Docker Desktop node may mount it, but shared access does not prove the application is safe under concurrent use or across multiple nodes. The current full web-directory mount, application sessions, cache, uploads, installation, upgrades and file locking all need review. One local node also remains a single point of failure.
+
+For a controlled local experiment, use only disposable data and wait until the existing store is fully installed. Keep automatic installation disabled. Confirm the namespace and context before making changes. Multiple application processes will access the same local web-directory volume, so test only after accepting that this is an experiment, not a supported multi-node production design.
+
+1. Record the baseline:
+
+```bash
+kubectl --context docker-desktop get deploy,pods,pvc -n prestashop-local
+kubectl --context docker-desktop describe service prestashop-local -n prestashop-local
+```
+
+2. Verify `PS_INSTALL_AUTO` is `0` in the running application, then use Helm to request two replicas. The `--reuse-values` flag preserves the existing release settings while overriding the replica count. This changes the local release; it does not change the values file in Git:
+
+```bash
+helm upgrade prestashop-local infrastructure/localdeploy/prestashop \
+  --namespace prestashop-local --kube-context docker-desktop \
+  --reuse-values --set replicaCount=2
+
+kubectl --context docker-desktop rollout status deployment/prestashop-local \
+  -n prestashop-local --timeout=10m
+
+kubectl --context docker-desktop get pods -n prestashop-local \
+  -l app.kubernetes.io/instance=prestashop-local
+
+kubectl --context docker-desktop describe service prestashop-local \
+  -n prestashop-local
+```
+
+3. Record whether both pods become ready and whether the Service reports two endpoints. Exercise sample login, catalogue, cart and file operations. Inspect failures before proceeding; do not treat two ready pods as proof of safe concurrent use. Kubernetes port-forward to a Service selects a pod and by itself does not demonstrate traffic balancing across both pods or cross-pod session behaviour.
+
+4. Return the local release to one replica using the values-file procedure below. Check the store and sample data again. Command-line overrides are an exploratory local change, not a GitOps workflow. For a lasting desired replica count, review and commit the appropriate values file and deploy it through the chosen workflow.
+
+### Managing the replica count in a file
+
+To return to one application replica, set `replicaCount: 1` in `infrastructure/localdeploy/prestashop/values.yaml`, then render and review the chart before upgrading. The user reported applying the return to one; no separate final deployment output was recorded. Check prior release overrides locally with `helm get values prestashop-local -n prestashop-local --kube-context docker-desktop`; do not share any secrets that might be present. Confirm the file contains all settings that should be retained, including `prestashop.installAuto: "0"`, the database Secret references and local domain. The `--reset-values` option deliberately discards previously stored release overrides, so migrate any required overrides into the file first.
+
+```bash
+helm lint infrastructure/localdeploy/prestashop
+helm template prestashop-local infrastructure/localdeploy/prestashop \
+  --namespace prestashop-local \
+  -f infrastructure/localdeploy/prestashop/values.yaml
+
+helm upgrade prestashop-local infrastructure/localdeploy/prestashop \
+  --namespace prestashop-local --kube-context docker-desktop \
+  --reset-values -f infrastructure/localdeploy/prestashop/values.yaml
+```
+
+After the upgrade, verify the deployment has one ready application replica and recheck the store and test product:
+
+```bash
+kubectl --context docker-desktop rollout status deployment/prestashop-local \
+  -n prestashop-local --timeout=10m
+kubectl --context docker-desktop get deployment,pods,pvc -n prestashop-local
+```
+
+Commit the reviewed values file to record the intended setting; this is not GitOps until a controller actually reconciles the committed configuration. If port-forwarding was attached to a removed pod, restart it. Scaling the workload is separate from deleting its PVC; do not delete the claims as part of this test.
+
+Before calling a scaled design production-ready, assess shared or externalized files, sessions and caching; coordinate schema upgrades and initialization; use supported multi-node storage; test failures and recovery; and establish load, latency, availability and security requirements. HPA additionally requires appropriate resource requests and working metrics; it is not currently demonstrated.
+
+## Known limitations and recovery considerations
+
+- Kubernetes, database and application each currently have a single local failure domain.
+- The `standard` storage class shown in this lab has a `Delete` reclaim policy. Deleting PVCs can delete their underlying data. Helm uninstall, namespace deletion or cluster reset can therefore cause data loss; inspect the actual deletion plan and protect data first.
+- Database files and application files both matter for a complete recovery. PVC persistence is not a backup; automated backups and isolated restore testing are future work.
+- MySQL runs in the cluster for learning. A future Azure design can evaluate Azure Database for MySQL Flexible Server with private connectivity, TLS, backups and measured sizing.
+- TLS, public ingress, observability, security hardening, payment sandbox integration and production performance testing have not been demonstrated here.
+- MailDev is for synthetic test email, not production delivery; its test inbox and any configuration should be protected and treated as ephemeral unless persistence is configured and verified.
+- Changing a Git value does not change the cluster until a Helm upgrade or a GitOps controller applies it. Helm itself is not an always-running reconciliation controller.
+- An application image update must be tested with the persisted web directory; a mount can retain old application files and affect upgrades.
+
+## Roadmap
+
+1. Document and automate a repeatable fresh-install and safe recovery workflow; verify it in an isolated environment.
+2. Extend cross-pod testing to concurrency, failure and recovery, and document the local replica experiment's limitations.
+3. Add GitHub Actions to lint and render Helm charts on changes. Build an image only when a custom image is actually required; add image scanning and review as appropriate.
+4. Introduce Argo CD to reconcile approved Helm configuration from Git to a non-production cluster.
+5. Design AKS networking, managed MySQL, storage, ingress, identity and monitoring with Terraform/HCP Terraform; estimate costs before deployment.
+6. Test backup/restore, security, application behaviour and scaling before any production use.
+
+## References
+
+- [PrestaShop project](https://github.com/PrestaShop/PrestaShop)
+- [PrestaShop Docker image](https://hub.docker.com/r/prestashop/prestashop)
+- [Helm documentation](https://helm.sh/docs/)
+- [Kubernetes persistent volumes](https://kubernetes.io/docs/concepts/storage/persistent-volumes/)
+- [Kubernetes port forwarding](https://kubernetes.io/docs/reference/kubectl/generated/kubectl_port-forward/)
